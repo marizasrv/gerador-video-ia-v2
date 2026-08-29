@@ -1,83 +1,62 @@
-import os
-import tempfile
+import os, tempfile
 from pathlib import Path
-
 import streamlit as st
-from huggingface_hub import InferenceClient
+import fal_client
+import requests
 
-st.set_page_config(page_title="Gerador Vídeo IA V2", page_icon="🎬", layout="centered")
-st.title("🎬 Gerador de Vídeo IA — V2")
-st.write("Transforme uma imagem em um pequeno vídeo usando IA.")
+st.set_page_config(page_title="Gerador de Vídeo IA", page_icon="🎬")
+st.title("🎬 Gerador de Vídeo IA")
+st.write("Transforme uma imagem em vídeo com movimento usando IA.")
 
 try:
-    HF_TOKEN = str(st.secrets["HF_TOKEN"]).strip()
+    FAL_KEY=str(st.secrets["FAL_KEY"]).strip()
 except Exception:
-    st.error("HF_TOKEN não encontrado. Adicione sua chave nos Secrets do Streamlit.")
+    st.error("FAL_KEY não encontrada. Adicione em Manage app → Settings → Secrets.")
     st.stop()
 
-if not HF_TOKEN.startswith("hf_"):
-    st.error("A chave HF_TOKEN parece inválida.")
-    st.stop()
+os.environ["FAL_KEY"]=FAL_KEY
 
-provider = st.selectbox("Provedor", ["fal-ai", "replicate"])
-model = st.text_input("Modelo", value="Wan-AI/Wan2.2-TI2V-5B")
+imagem=st.file_uploader("1. Envie a imagem",type=["jpg","jpeg","png","webp"])
+prompt=st.text_area("2. Descreva o movimento",value="The character moves naturally, blinks and looks around. Hair and clothes move softly. Gentle cinematic camera movement. Preserve the same character appearance.",height=150)
+formato=st.selectbox("3. Formato",["YouTube 16:9","Vertical 9:16","Automático"])
+resolucao=st.selectbox("4. Qualidade",["720p","580p","480p"])
+aspect={"YouTube 16:9":"16:9","Vertical 9:16":"9:16","Automático":"auto"}
 
-imagem = st.file_uploader("1. Envie a imagem da cena", type=["jpg", "jpeg", "png", "webp"])
-prompt = st.text_area(
-    "2. Descreva o movimento",
-    value="The character moves naturally, blinks and looks around. Gentle cinematic camera movement, smooth motion, consistent character appearance."
-)
-
-st.caption("Dica: descreva movimentos simples. Ex.: Luna caminha lentamente, olha para o espelho e levanta a varinha.")
-
-if st.button("✨ Gerar vídeo com IA", type="primary", use_container_width=True):
+if st.button("✨ Gerar vídeo com IA",type="primary",use_container_width=True):
     if imagem is None:
-        st.error("Envie uma imagem primeiro.")
-        st.stop()
+        st.error("Envie uma imagem primeiro."); st.stop()
     if not prompt.strip():
-        st.error("Escreva o movimento desejado.")
-        st.stop()
+        st.error("Escreva o movimento desejado."); st.stop()
+    try:
+        with st.spinner("Enviando a imagem..."):
+            suffix=Path(imagem.name).suffix or ".jpg"
+            with tempfile.NamedTemporaryFile(delete=False,suffix=suffix) as tmp:
+                tmp.write(imagem.getbuffer()); image_path=tmp.name
+            image_url=fal_client.upload_file(image_path)
 
-    client = InferenceClient(provider=provider, api_key=HF_TOKEN)
-
-    with st.spinner("A IA está criando o vídeo. Isso pode levar alguns minutos..."):
-        try:
-            # Salva o upload temporariamente. Alguns providers/modelos aceitam
-            # entrada combinada de imagem+texto; disponibilidade varia por provider.
-            tmp = Path(tempfile.mkdtemp())
-            img_path = tmp / imagem.name
-            img_path.write_bytes(imagem.getbuffer())
-
-            # Tenta image_to_video quando disponível no cliente/provider.
-            if hasattr(client, "image_to_video"):
-                video = client.image_to_video(
-                    image=str(img_path),
-                    prompt=prompt,
-                    model=model,
-                )
-            else:
-                st.error("Sua versão do huggingface_hub não possui image_to_video. Atualize requirements.txt.")
-                st.stop()
-
-            if isinstance(video, (bytes, bytearray)):
-                data = bytes(video)
-            elif hasattr(video, "read"):
-                data = video.read()
-            else:
-                # Algumas versões retornam um caminho/objeto semelhante a arquivo.
-                p = Path(str(video))
-                data = p.read_bytes()
-
-            st.success("✅ Vídeo criado!")
-            st.video(data)
-            st.download_button(
-                "⬇️ Baixar vídeo MP4",
-                data=data,
-                file_name="cena_video_ia.mp4",
-                mime="video/mp4",
-                use_container_width=True
+        with st.spinner("Criando o vídeo. Pode levar alguns minutos..."):
+            result=fal_client.subscribe(
+                "fal-ai/wan/v2.2-a14b/image-to-video/turbo",
+                arguments={
+                    "image_url":image_url,
+                    "prompt":prompt.strip(),
+                    "resolution":resolucao,
+                    "aspect_ratio":aspect[formato],
+                    "enable_safety_checker":True,
+                    "enable_output_safety_checker":True
+                },
+                with_logs=True
             )
-        except Exception as e:
-            st.error("Não foi possível gerar o vídeo com este modelo/provedor.")
-            st.code(str(e))
-            st.info("Tente outro modelo/provedor. Geração de vídeo pode exigir créditos no provedor escolhido.")
+        video_url=result["video"]["url"]
+        st.success("✅ Vídeo criado!")
+        st.video(video_url)
+        r=requests.get(video_url,timeout=120); r.raise_for_status()
+        st.download_button("⬇️ Baixar vídeo MP4",r.content,"video_ia.mp4","video/mp4",use_container_width=True)
+    except Exception as e:
+        st.error("Não foi possível gerar o vídeo.")
+        msg=str(e)
+        if "401" in msg or "Unauthorized" in msg:
+            st.warning("Confira sua FAL_KEY nos Secrets.")
+        elif "402" in msg or "credit" in msg.lower() or "payment" in msg.lower():
+            st.warning("Sua conta fal pode precisar de créditos.")
+        st.code(msg)
